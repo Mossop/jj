@@ -28,6 +28,12 @@ and this project adheres to
 
 ### Fixed bugs
 
+* On case-insensitive filesystems (the default on macOS and Windows), working
+  copy files whose on-disk names differ only in case from the tracked names are
+  no longer reported as renamed, e.g. after checking out a case-only rename or
+  a Git tree containing paths that differ only in case.
+  [#1737](https://github.com/jj-vcs/jj/issues/1737)
+
 * Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
   `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
 

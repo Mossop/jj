@@ -298,6 +298,22 @@ impl FileIdentity {
     }
 }
 
+/// Whether the filesystem of this directory treats file names that differ only
+/// in case as the same file.
+pub fn check_case_insensitive(dir: impl AsRef<Path>) -> io::Result<bool> {
+    let temp_file = tempfile::Builder::new()
+        .prefix("jj-CaseProbe-")
+        .tempfile_in(dir)?;
+    let path = temp_file.path();
+    let file_name = path.file_name().unwrap().to_string_lossy();
+    let folded_path = path.with_file_name(file_name.to_ascii_lowercase());
+    match FileIdentity::from_symlink_path(&folded_path) {
+        Ok(identity) => Ok(identity == FileIdentity::from_symlink_path(path)?),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Reads from an async source and writes to a sync destination. Does not spawn
 /// a task, so writes will block.
 pub async fn copy_async_to_sync<R: AsyncRead, W: Write + ?Sized>(
@@ -500,6 +516,17 @@ mod tests {
         let dir = new_temp_dir();
         let supported = check_executable_bit_support(dir.path())?;
         assert!(supported);
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_case_insensitive() -> TestResult {
+        // The result depends on the filesystem, so just check it can be
+        // determined and is consistent with what the filesystem reports.
+        let dir = new_temp_dir();
+        let case_insensitive = check_case_insensitive(dir.path())?;
+        fs::write(dir.path().join("Probe"), b"")?;
+        assert_eq!(dir.path().join("probe").exists(), case_insensitive);
         Ok(())
     }
 

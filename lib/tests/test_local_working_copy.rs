@@ -3201,3 +3201,213 @@ fn test_always_store_empty_tree() -> TestResult {
     assert!(empty_tree.data.is_empty());
     Ok(())
 }
+
+/// Returns true if the test should be skipped because it lays out directories
+/// that differ only in case, which requires a case-sensitive filesystem. See
+/// `test_snapshot_case_insensitive_fs` for the equivalent on a real
+/// case-insensitive filesystem.
+fn skip_on_case_insensitive_fs() -> TestResult<bool> {
+    let temp_dir = testutils::new_temp_dir();
+    if file_util::check_case_insensitive(temp_dir.path())? {
+        eprintln!("Skipping test because the filesystem is case-insensitive");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Checks out `tree` into a new tree state, lets `rearrange` change the disk
+/// layout as a case-insensitive filesystem would, and returns the tree state
+/// after a snapshot with case-insensitivity forced on or off.
+fn snapshot_case_rearranged(
+    test_repo: &TestRepo,
+    tree: &MergedTree,
+    case_insensitive: bool,
+    rearrange: impl FnOnce(&Path) -> io::Result<()>,
+) -> TestResult<TreeState> {
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let mut tree_state = TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path,
+        &tree_state_settings,
+    )?;
+    tree_state.check_out(tree)?;
+    rearrange(&workspace_root)?;
+    tree_state.set_case_insensitive(case_insensitive);
+    tree_state.snapshot(&empty_snapshot_options()).block_on()?;
+    Ok(tree_state)
+}
+
+#[test]
+fn test_snapshot_case_insensitive_renamed_dir() -> TestResult {
+    // A directory whose on-disk name differs in case from the tracked name,
+    // e.g. because a case-only rename was checked out on a case-insensitive
+    // filesystem.
+    let rearrange = |root: &Path| std::fs::rename(root.join("jinja2"), root.join("Jinja2"));
+
+    let test_repo = TestRepo::init();
+    let tree = create_tree(&test_repo.repo, &[(repo_path("jinja2/file"), "contents\n")]);
+    let tree_state = snapshot_case_rearranged(&test_repo, &tree, true, rearrange)?;
+    assert_tree_eq!(*tree_state.current_tree(), tree);
+
+    // On a case-sensitive filesystem, it's a rename.
+    let test_repo = TestRepo::init();
+    let tree = create_tree(&test_repo.repo, &[(repo_path("jinja2/file"), "contents\n")]);
+    let tree_state = snapshot_case_rearranged(&test_repo, &tree, false, rearrange)?;
+    let expected_tree = create_tree(&test_repo.repo, &[(repo_path("Jinja2/file"), "contents\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_case_insensitive_renamed_file() -> TestResult {
+    let test_repo = TestRepo::init();
+    let tree = create_tree(
+        &test_repo.repo,
+        &[
+            (repo_path("dir/readme"), "a\n"),
+            (repo_path("other"), "b\n"),
+        ],
+    );
+    let tree_state = snapshot_case_rearranged(&test_repo, &tree, true, |root| {
+        std::fs::rename(root.join("dir/readme"), root.join("dir/README"))?;
+        std::fs::write(root.join("dir/README"), "modified\n")
+    })?;
+    let expected_tree = create_tree(
+        &test_repo.repo,
+        &[
+            (repo_path("dir/readme"), "modified\n"),
+            (repo_path("other"), "b\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_case_insensitive_dir_aliases() -> TestResult {
+    if skip_on_case_insensitive_fs()? {
+        return Ok(());
+    }
+    // The tree has several directories that differ only in case, which a
+    // case-insensitive filesystem stores in a single directory.
+    let test_repo = TestRepo::init();
+    let tree = create_tree(
+        &test_repo.repo,
+        &[
+            (repo_path("WebIDL/a"), "a\n"),
+            (repo_path("WebIDL/sub/c"), "c\n"),
+            (repo_path("webidl/b"), "b\n"),
+            (repo_path("webidl/sub/d"), "d\n"),
+            (repo_path("webIDL/e"), "e\n"),
+        ],
+    );
+    let tree_state = snapshot_case_rearranged(&test_repo, &tree, true, |root| {
+        for (from, to) in [
+            ("webidl/b", "WebIDL/b"),
+            ("webidl/sub/d", "WebIDL/sub/d"),
+            ("webIDL/e", "WebIDL/e"),
+        ] {
+            std::fs::rename(root.join(from), root.join(to))?;
+        }
+        std::fs::remove_dir(root.join("webidl/sub"))?;
+        std::fs::remove_dir(root.join("webidl"))?;
+        std::fs::remove_dir(root.join("webIDL"))?;
+        // Modify files tracked under each alias, and add a new file.
+        std::fs::write(root.join("WebIDL/a"), "a2\n")?;
+        std::fs::write(root.join("WebIDL/sub/d"), "d2\n")?;
+        std::fs::write(root.join("WebIDL/new"), "new\n")
+    })?;
+    let expected_tree = create_tree(
+        &test_repo.repo,
+        &[
+            (repo_path("WebIDL/a"), "a2\n"),
+            (repo_path("WebIDL/new"), "new\n"),
+            (repo_path("WebIDL/sub/c"), "c\n"),
+            (repo_path("webidl/b"), "b\n"),
+            (repo_path("webidl/sub/d"), "d2\n"),
+            (repo_path("webIDL/e"), "e\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_case_insensitive_deleted() -> TestResult {
+    if skip_on_case_insensitive_fs()? {
+        return Ok(());
+    }
+    // Deleting a file tracked under a case alias is still detected.
+    let test_repo = TestRepo::init();
+    let tree = create_tree(
+        &test_repo.repo,
+        &[(repo_path("Dir/a"), "a\n"), (repo_path("dir/b"), "b\n")],
+    );
+    let tree_state = snapshot_case_rearranged(&test_repo, &tree, true, |root| {
+        std::fs::remove_file(root.join("dir/b"))?;
+        std::fs::remove_dir(root.join("dir"))
+    })?;
+    let expected_tree = create_tree(&test_repo.repo, &[(repo_path("Dir/a"), "a\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_snapshot_case_insensitive_fs() -> TestResult {
+    // Unlike the tests above, this checks the behavior on a real
+    // case-insensitive filesystem, such as the defaults on macOS and Windows.
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+    if !file_util::check_case_insensitive(&workspace_root)? {
+        eprintln!("Skipping test because the filesystem is case-sensitive");
+        return Ok(());
+    }
+    let repo = test_workspace.repo.clone();
+
+    // Checking out a case-only rename writes the new file into the existing
+    // directory.
+    let tree1 = create_tree(&repo, &[(repo_path("Jinja2/file"), "contents\n")]);
+    let tree2 = create_tree(&repo, &[(repo_path("jinja2/file"), "contents\n")]);
+    let commit1 = commit_with_tree(repo.store(), tree1);
+    let commit2 = commit_with_tree(repo.store(), tree2.clone());
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit1)
+        .block_on()?;
+    ws.check_out(repo.op_id().clone(), None, &commit2)
+        .block_on()?;
+    assert_tree_eq!(test_workspace.snapshot()?, tree2);
+
+    // Directories that differ only in case are checked out into one directory.
+    let tree3 = create_tree(
+        &repo,
+        &[
+            (repo_path("WebIDL/a"), "a\n"),
+            (repo_path("webidl/b"), "b\n"),
+            (repo_path("webidl/sub/c"), "c\n"),
+        ],
+    );
+    let commit3 = commit_with_tree(repo.store(), tree3.clone());
+    let ws = &mut test_workspace.workspace;
+    ws.check_out(repo.op_id().clone(), None, &commit3)
+        .block_on()?;
+    assert_tree_eq!(test_workspace.snapshot()?, tree3);
+
+    // Changes are recorded at the tracked path.
+    std::fs::write(workspace_root.join("webidl").join("b"), "modified b\n")?;
+    let expected_tree = create_tree(
+        &repo,
+        &[
+            (repo_path("WebIDL/a"), "a\n"),
+            (repo_path("webidl/b"), "modified b\n"),
+            (repo_path("webidl/sub/c"), "c\n"),
+        ],
+    );
+    assert_tree_eq!(test_workspace.snapshot()?, expected_tree);
+    Ok(())
+}

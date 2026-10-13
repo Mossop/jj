@@ -43,7 +43,6 @@ use std::sync::mpsc::channel;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use either::Either;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
@@ -84,6 +83,7 @@ use crate::conflicts::materialize_tree_value;
 pub use crate::eol::EolConversionMode;
 use crate::eol::TargetEolStrategy;
 use crate::file_util::FileIdentity;
+use crate::file_util::check_case_insensitive;
 use crate::file_util::check_symlink_support;
 use crate::file_util::copy_async_to_sync;
 use crate::file_util::persist_temp_file;
@@ -297,9 +297,7 @@ pub struct FileState {
     pub mtime: MillisSinceEpoch,
     pub size: u64,
     pub materialized_conflict_data: Option<MaterializedConflictData>,
-    /* TODO: What else do we need here? Git stores a lot of fields.
-     * TODO: Could possibly handle case-insensitive file systems keeping an
-     *       Option<PathBuf> with the actual path here. */
+    /* TODO: What else do we need here? Git stores a lot of fields. */
 }
 
 impl FileState {
@@ -543,6 +541,31 @@ impl<'a> FileStates<'a> {
             entry_name == base.as_internal_str()
         });
         start..(start + len)
+    }
+
+    /// Returns the sorted, unique names of the direct children of `dir`.
+    /// Requires that all entries share the same prefix `dir`.
+    fn child_names_at(&self, dir: &RepoPath) -> Vec<&'a str> {
+        debug_assert!(self.paths().all(|path| path.starts_with(dir)));
+        let slash_len = usize::from(!dir.is_root());
+        let prefix_len = dir.as_internal_file_string().len() + slash_len;
+        fn entry_name(path: &str, prefix_len: usize) -> &str {
+            let tail = path.get(prefix_len..).unwrap_or("");
+            tail.split_once('/').map_or(tail, |(name, _)| name)
+        }
+        let mut names = vec![];
+        let mut rest = self.data;
+        while let Some(entry) = rest.first() {
+            let name = entry_name(&entry.path, prefix_len);
+            // Skip all entries of <dir>/<name> and <dir>/<name>/**
+            let len = rest.partition_point(|entry| entry_name(&entry.path, prefix_len) == name);
+            rest = &rest[len..];
+            // Empty name is <dir> file itself on file->dir transition
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        names
     }
 
     /// Iterates file state entries sorted by path.
@@ -1001,6 +1024,8 @@ pub struct TreeState {
     sparse_patterns: Vec<RepoPathBuf>,
     own_mtime: MillisSinceEpoch,
     symlink_support: bool,
+    /// Whether file names differing only in case refer to the same file.
+    case_insensitive: bool,
 
     /// The most recent clock value returned by Watchman. Will only be set if
     /// the repo is configured to use the Watchman filesystem monitor and
@@ -1041,6 +1066,13 @@ impl TreeState {
 
     pub fn file_states(&self) -> FileStates<'_> {
         self.file_states.all()
+    }
+
+    /// Overrides whether the working copy filesystem is treated as
+    /// case-insensitive. Intended for testing.
+    #[cfg(feature = "testing")]
+    pub fn set_case_insensitive(&mut self, case_insensitive: bool) {
+        self.case_insensitive = case_insensitive;
     }
 
     pub fn sparse_patterns(&self) -> &Vec<RepoPathBuf> {
@@ -1087,6 +1119,7 @@ impl TreeState {
         }: &TreeStateSettings,
     ) -> Self {
         let exec_policy = ExecChangePolicy::new(*exec_change_setting, &state_path);
+        let case_insensitive = check_case_insensitive(&state_path).unwrap_or(false);
         Self {
             store: store.clone(),
             working_copy_path,
@@ -1096,6 +1129,7 @@ impl TreeState {
             sparse_patterns: vec![RepoPathBuf::root()],
             own_mtime: MillisSinceEpoch(0),
             symlink_support: check_symlink_support().unwrap_or(false),
+            case_insensitive,
             watchman_clock: None,
             conflict_marker_style: *conflict_marker_style,
             exec_policy,
@@ -1361,6 +1395,7 @@ impl TreeState {
                 disk_dir: self.working_copy_path.clone(),
                 git_ignore: base_ignores.clone(),
                 file_states: self.file_states.all(),
+                case_aliases: vec![],
             };
             // Here we use scope as a queue of per-directory jobs.
             rayon::scope(|scope| {
@@ -1514,6 +1549,18 @@ struct DirectoryToVisit<'a> {
     disk_dir: PathBuf,
     git_ignore: Arc<GitIgnoreFile>,
     file_states: FileStates<'a>,
+    /// Other tracked directories which differ from `dir` only in case, and
+    /// therefore share `disk_dir` on a case-insensitive filesystem.
+    case_aliases: Vec<(RepoPathBuf, FileStates<'a>)>,
+}
+
+/// Tracked directory entry names of a directory and its case aliases, keyed by
+/// case-folded name. Each value lists `(alias_index, name)` pairs where index 0
+/// is the directory itself.
+type CaseFoldedNames<'a> = HashMap<String, Vec<(usize, &'a str)>>;
+
+fn fold_case(name: &str) -> String {
+    name.to_lowercase()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1582,6 +1629,7 @@ impl FileSnapshotter<'_> {
             disk_dir,
             mut git_ignore,
             file_states,
+            case_aliases,
         } = directory_to_visit;
 
         let git_ignore_file_name = RepoPathComponent::new(".gitignore").expect("static string");
@@ -1599,25 +1647,89 @@ impl FileSnapshotter<'_> {
                 message: format!("Failed to read directory {}", disk_dir.display()),
                 err: err.into(),
             })?;
-        let (dirs, files) = dir_entries
+        // The directory itself comes first, followed by its case aliases.
+        let tracked_dirs = iter::once((dir, file_states))
+            .chain(case_aliases)
+            .collect_vec();
+        let case_folded_names = self.tree_state.case_insensitive.then(|| {
+            let mut names = CaseFoldedNames::new();
+            for (index, (dir, file_states)) in tracked_dirs.iter().enumerate() {
+                for name in file_states.child_names_at(dir) {
+                    names
+                        .entry(fold_case(name))
+                        .or_default()
+                        .push((index, name));
+                }
+            }
+            names
+        });
+        let entries: Vec<_> = dir_entries
             .into_par_iter()
             // Don't split into too many small jobs. For a small directory,
             // sequential scan should be fast enough.
             .with_min_len(100)
             .filter_map(|entry| {
-                self.process_dir_entry(&dir, &git_ignore, file_states, &entry, scope)
-                    .block_on()
-                    .transpose()
-            })
-            .map(|item| match item {
-                Ok((PresentDirEntryKind::Dir, name)) => Ok(Either::Left(name)),
-                Ok((PresentDirEntryKind::File, name)) => Ok(Either::Right(name)),
-                Err(err) => Err(err),
+                self.process_dir_entry(
+                    &tracked_dirs,
+                    case_folded_names.as_ref(),
+                    &git_ignore,
+                    &entry,
+                    scope,
+                )
+                .block_on()
+                .transpose()
             })
             .collect::<Result<_, _>>()?;
-        let present_entries = PresentDirEntries { dirs, files };
-        self.emit_deleted_files(&dir, file_states, &present_entries);
+        let mut present_entries = vec![
+            PresentDirEntries {
+                dirs: HashSet::new(),
+                files: HashSet::new(),
+            };
+            tracked_dirs.len()
+        ];
+        for (kind, index, name) in entries {
+            // Entries tracked under names that differ only in case share the
+            // same disk entry, so they're all present. Tracked files among
+            // them are left unchanged since only one can be snapshotted.
+            let aliases = case_folded_names
+                .as_ref()
+                .and_then(|names| names.get(&fold_case(&name)))
+                .into_iter()
+                .flatten()
+                .map(|&(index, name)| (index, name.to_owned()));
+            for (index, name) in iter::once((index, name)).chain(aliases) {
+                match kind {
+                    PresentDirEntryKind::Dir => present_entries[index].dirs.insert(name),
+                    PresentDirEntryKind::File => present_entries[index].files.insert(name),
+                };
+            }
+        }
+        for ((dir, file_states), present_entries) in tracked_dirs.iter().zip(&present_entries) {
+            self.emit_deleted_files(dir, *file_states, present_entries);
+        }
         Ok(())
+    }
+
+    /// Finds the tracked entry that the disk entry `disk_name` corresponds to
+    /// if it isn't tracked in the directory itself under the same name. The
+    /// tracked entry may differ in case and be in one of the `tracked_dirs`.
+    /// Returns the index into `tracked_dirs` and the tracked name.
+    fn find_case_alias<'a>(
+        tracked_dirs: &[(RepoPathBuf, FileStates<'_>)],
+        case_folded_names: &CaseFoldedNames<'a>,
+        disk_name: &str,
+    ) -> Option<(usize, &'a str)> {
+        let (dir, file_states) = &tracked_dirs[0];
+        let component = RepoPathComponent::new(disk_name).unwrap();
+        if !file_states.prefixed_at(dir, component).is_empty() {
+            return None;
+        }
+        let candidates = case_folded_names.get(&fold_case(disk_name))?;
+        candidates
+            .iter()
+            .find(|&&(_, name)| name == disk_name)
+            .or_else(|| candidates.first())
+            .copied()
     }
 
     /// Loads the ignore file named `file_name` and returns its contents if it
@@ -1707,30 +1819,40 @@ impl FileSnapshotter<'_> {
         Ok(Some(buf))
     }
 
+    /// Processes a disk entry, returning its kind, the index of the
+    /// `tracked_dirs` it belongs to, and its tracked name if it is present.
     async fn process_dir_entry<'scope>(
         &'scope self,
-        dir: &RepoPath,
+        tracked_dirs: &[(RepoPathBuf, FileStates<'scope>)],
+        case_folded_names: Option<&CaseFoldedNames<'scope>>,
         git_ignore: &Arc<GitIgnoreFile>,
-        file_states: FileStates<'scope>,
         entry: &DirEntry,
         scope: &rayon::Scope<'scope>,
-    ) -> Result<Option<(PresentDirEntryKind, String)>, SnapshotError> {
+    ) -> Result<Option<(PresentDirEntryKind, usize, String)>, SnapshotError> {
         let file_type = entry.file_type().unwrap();
         let file_name = entry.file_name();
-        let name_string = match file_name.into_string() {
+        let disk_name = match file_name.into_string() {
             Ok(name_string) => name_string,
             Err(name) => {
                 // A path that isn't valid UTF-8 can't be represented as a
                 // RepoPath, so it can never be tracked. Skip it instead of
                 // failing the whole snapshot, and let the caller report it.
-                self.invalid_utf8_paths_tx.send((dir.to_owned(), name)).ok();
+                let dir = &tracked_dirs[0].0;
+                self.invalid_utf8_paths_tx.send((dir.clone(), name)).ok();
                 return Ok(None);
             }
         };
 
-        if RESERVED_DIR_NAMES.contains(&name_string.as_str()) {
+        if RESERVED_DIR_NAMES.contains(&disk_name.as_str()) {
             return Ok(None);
         }
+        // On a case-insensitive filesystem, the disk entry may be tracked under
+        // a name that differs in case, possibly in a case alias of this dir.
+        let (index, name_string) = case_folded_names
+            .and_then(|names| Self::find_case_alias(tracked_dirs, names, &disk_name))
+            .map_or((0, disk_name), |(index, name)| (index, name.to_owned()));
+        let (dir, file_states) = &tracked_dirs[index];
+        let file_states = *file_states;
         let name = RepoPathComponent::new(&name_string).unwrap();
         let path = dir.join(name);
         let maybe_current_file_state = file_states.get_at(dir, name);
@@ -1742,6 +1864,24 @@ impl FileSnapshotter<'_> {
 
         if file_type.is_dir() {
             let file_states = file_states.prefixed_at(dir, name);
+            // Other tracked directories that differ only in case share
+            // this disk directory.
+            let case_aliases: Vec<_> = case_folded_names
+                .and_then(|names| names.get(&fold_case(&name_string)))
+                .into_iter()
+                .flatten()
+                .filter(|&&(alias_index, alias_name)| {
+                    (alias_index, alias_name) != (index, name_string.as_str())
+                })
+                .map(|&(alias_index, alias_name)| {
+                    let (alias_dir, alias_file_states) = &tracked_dirs[alias_index];
+                    let alias_name = RepoPathComponent::new(alias_name).unwrap();
+                    (
+                        alias_dir.join(alias_name),
+                        alias_file_states.prefixed_at(alias_dir, alias_name),
+                    )
+                })
+                .collect();
             // If a submodule was added in commit C, and a user decides to run
             // `jj new <something before C>` from after C, then the submodule
             // files stick around but it is no longer seen as a submodule.
@@ -1765,7 +1905,11 @@ impl FileSnapshotter<'_> {
                 // start_tracking_matcher is NOT tested here because we need to
                 // scan directory entries to report untracked paths.
                 self.spawn_ok(scope, move |_| {
-                    self.visit_tracked_files(file_states).block_on()
+                    self.visit_tracked_files(file_states).block_on()?;
+                    for (_, alias_file_states) in case_aliases {
+                        self.visit_tracked_files(alias_file_states).block_on()?;
+                    }
+                    Ok(())
                 });
             } else if !self.matcher.visit(&path).is_nothing() {
                 let directory_to_visit = DirectoryToVisit {
@@ -1773,6 +1917,7 @@ impl FileSnapshotter<'_> {
                     disk_dir,
                     git_ignore: git_ignore.clone(),
                     file_states,
+                    case_aliases,
                 };
                 self.spawn_ok(scope, |scope| {
                     self.visit_directory(directory_to_visit, scope)
@@ -1780,7 +1925,7 @@ impl FileSnapshotter<'_> {
             }
             // Whether or not the directory path matches, any child file entries
             // shouldn't be touched within the current recursion step.
-            Ok(Some((PresentDirEntryKind::Dir, name_string)))
+            Ok(Some((PresentDirEntryKind::Dir, index, name_string)))
         } else if self.matcher.matches(&path) {
             if let Some(progress) = self.progress {
                 progress(&path);
@@ -1825,7 +1970,7 @@ impl FileSnapshotter<'_> {
                         new_file_state,
                     )
                     .await?;
-                    Ok(Some((PresentDirEntryKind::File, name_string)))
+                    Ok(Some((PresentDirEntryKind::File, index, name_string)))
                 } else {
                     // Special file is not considered present
                     Ok(None)
